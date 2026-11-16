@@ -177,42 +177,105 @@ export function prepareBattle(battle) {
   battle._ready = true;
 }
 
-function sampleTrack(keys, t, fields) {
-  if (t <= keys[0].t) return { ...keys[0] };
-  const last = keys[keys.length - 1];
-  if (t >= last.t) return { ...last };
-  let lo = 0;
-  for (let i = 0; i < keys.length - 1; i++) {
-    if (t <= keys[i + 1].t) {
-      lo = i;
+function findSegment(keys, t) {
+  const last = keys.length - 1;
+  if (t <= keys[0].t) return { i: 0, u: 0, end: true };
+  if (t >= keys[last].t) return { i: last - 1, u: 1, end: true };
+  let i = 0;
+  for (let k = 0; k < last; k++) {
+    if (t <= keys[k + 1].t) {
+      i = k;
       break;
     }
   }
-  const a = keys[lo];
-  const b = keys[lo + 1];
-  const e = smooth((t - a.t) / (b.t - a.t || 1));
-  const out = { ...a };
-  for (const f of fields) {
-    if (f === "facing") out.facing = lerpAngle(a.facing, b.facing, e);
-    else if (typeof a[f] === "number") out[f] = lerp(a[f], b[f], e);
+  const span = keys[i + 1].t - keys[i].t || 1;
+  return { i, u: (t - keys[i].t) / span, end: false };
+}
+
+// Hermite through the keys. Tension drops on a reversal so a rout
+// turns in place instead of swinging wide of the field.
+function flowPoint(keys, i, u) {
+  const p1 = keys[i];
+  const p2 = keys[i + 1];
+  const p0 = keys[Math.max(0, i - 1)];
+  const p3 = keys[Math.min(keys.length - 1, i + 2)];
+  const inX = p1.x - p0.x;
+  const inY = p1.y - p0.y;
+  const outX = p2.x - p1.x;
+  const outY = p2.y - p1.y;
+  const nextX = p3.x - p2.x;
+  const nextY = p3.y - p2.y;
+  const leg = Math.hypot(outX, outY);
+  let tension = 0.5;
+  if (leg < 6) tension = 0;
+  else if (inX * outX + inY * outY < 0 || outX * nextX + outY * nextY < 0) tension = 0.12;
+  const atStart = i === 0;
+  const atEnd = i === keys.length - 2;
+  let s = u;
+  if (atStart && atEnd) s = smooth(u);
+  else if (atStart) s = u * u * (2 - u);
+  else if (atEnd) s = u + u * u - u * u * u;
+  const u2 = s * s;
+  const u3 = u2 * s;
+  const h00 = 2 * u3 - 3 * u2 + 1;
+  const h10 = u3 - 2 * u2 + s;
+  const h01 = -2 * u3 + 3 * u2;
+  const h11 = u3 - u2;
+  const m1x = tension * (p2.x - p0.x);
+  const m1y = tension * (p2.y - p0.y);
+  const m2x = tension * (p3.x - p1.x);
+  const m2y = tension * (p3.y - p1.y);
+  return {
+    x: h00 * p1.x + h10 * m1x + h01 * p2.x + h11 * m2x,
+    y: h00 * p1.y + h10 * m1y + h01 * p2.y + h11 * m2y,
+    reversal: tension < 0.2,
+  };
+}
+
+function orderForTravel(a, b) {
+  const moving = Math.hypot(b.x - a.x, b.y - a.y) > 8;
+  if (moving && b.order === "rout") return "rout";
+  if (moving && (a.order === "hold" || a.order === "fire")) return "march";
+  return a.order;
+}
+
+function sampleTrack(keys, t) {
+  if (!keys.length) return { x: 0, y: 0, facing: 0, order: "hold" };
+  if (keys.length === 1 || t <= keys[0].t) return { ...keys[0] };
+  const last = keys[keys.length - 1];
+  if (t >= last.t) return { ...last };
+  const seg = findSegment(keys, t);
+  const a = keys[seg.i];
+  const b = keys[seg.i + 1];
+  const eased = smooth(seg.u);
+  const flow = flowPoint(keys, seg.i, seg.u);
+  const faceU = flow.reversal ? eased : smooth(clamp(seg.u * 1.18, 0, 1));
+  const out = {
+    ...a,
+    x: flow.x,
+    y: flow.y,
+    facing: lerpAngle(a.facing, b.facing, faceU),
+    order: orderForTravel(a, b),
+  };
+  for (const f of ["width", "depth", "opacity", "jitter", "zoom"]) {
+    if (typeof a[f] === "number" && typeof b[f] === "number") out[f] = lerp(a[f], b[f], eased);
   }
   if (a.target && b.target) {
-    out.target = [lerp(a.target[0], b.target[0], e), lerp(a.target[1], b.target[1], e)];
+    out.target = [lerp(a.target[0], b.target[0], eased), lerp(a.target[1], b.target[1], eased)];
   }
-  out.order = a.order;
   return out;
 }
 
 export function sampleBattle(battle, t) {
   prepareBattle(battle);
   const time = clamp(t, 0, battle.duration);
-  const camera = sampleTrack(battle.camera, time, ["x", "y", "zoom"]);
+  const camera = sampleTrack(battle.camera, time);
   let phaseIndex = 0;
   for (let i = 0; i < battle.phases.length; i++) {
     if (battle.phases[i].t <= time) phaseIndex = i;
   }
   const units = battle.units.map((u) => {
-    const s = sampleTrack(u.keys, time, ["x", "y", "facing", "width", "depth", "opacity", "jitter"]);
+    const s = sampleTrack(u.keys, time);
     return {
       ...u,
       ...s,
@@ -664,12 +727,21 @@ function drawHelm(ctx, spec) {
   }
 }
 
+function gaitOf(spec, order) {
+  const speed = spec.speed || 0;
+  const amp =
+    order === "fight" ? 0.28 : order === "hold" ? clamp((speed - 2) / 14, 0, 0.35) : clamp((speed - 2) / 14, 0, 1);
+  const pace = (order === "charge" ? 8.5 : order === "rout" ? 11 : 7) + Math.min(speed, 36) * 0.16;
+  const gait = (spec.clock || 0) * pace + (spec.phase || 0);
+  return { amp, gait };
+}
+
 function drawFoot(ctx, spec, time, order) {
-  const moving = order === "march" || order === "charge" || order === "rout";
-  const pace = order === "charge" ? 13 : 9;
-  const bob = moving ? Math.sin(time * pace + spec.phase) * 0.65 : Math.sin(time * 1.6 + spec.phase) * 0.12;
-  const stride = moving ? Math.sin(time * pace + spec.phase) : 0;
-  ctx.translate(order === "charge" ? 0.8 : 0, bob);
+  const { amp, gait } = gaitOf(spec, order);
+  const stride = Math.sin(gait) * (1.15 + amp * 1.7);
+  const bob = amp > 0.04 ? Math.cos(gait * 2) * 0.55 * amp : Math.sin(time * 1.5 + spec.phase) * 0.1;
+  const lean = order === "charge" ? 1.1 * amp : order === "rout" ? 0.7 * amp : 0.35 * amp;
+  ctx.translate(lean, bob);
   ctx.strokeStyle = "#2a241c";
   ctx.lineWidth = 0.85;
   ctx.beginPath();
@@ -688,9 +760,11 @@ function drawFoot(ctx, spec, time, order) {
   ctx.fill();
   drawHelm(ctx, spec);
   ctx.restore();
-  if (order !== "rout" && spec.shieldShape) {
+  const dropShield = order === "rout" && (spec.jitter || 0) > 3 && hash(spec.slot || 0, 4) < Math.min(1, (spec.jitter || 0) / 14);
+  if (!dropShield && spec.shieldShape) {
     ctx.save();
     ctx.translate(3.1, -1.1);
+    ctx.rotate(Math.sin(gait) * 0.12 * amp);
     drawShield(ctx, spec);
     ctx.restore();
   }
@@ -744,8 +818,11 @@ function drawFoot(ctx, spec, time, order) {
 }
 
 function drawHorse(ctx, spec, time, order) {
-  const moving = order === "march" || order === "charge" || order === "rout";
-  const gallop = moving ? time * 13 + spec.phase : time * 1.5;
+  const { amp, gait } = gaitOf(spec, order);
+  const gallop = amp > 0.05 ? gait : time * 1.4 + spec.phase;
+  const lift = amp > 0.05 ? 1.5 * amp : 0.12;
+  ctx.translate(order === "charge" ? 0.8 * amp : 0, Math.sin(gallop * 2) * 0.45 * Math.max(amp, 0.15));
+  ctx.rotate(Math.sin(gallop) * 0.05 * amp);
   ctx.fillStyle = "rgba(40,30,20,0.18)";
   ctx.beginPath();
   ctx.ellipse(0, 3.4, 7, 1.7, 0, 0, Math.PI * 2);
@@ -754,7 +831,7 @@ function drawHorse(ctx, spec, time, order) {
   ctx.lineWidth = 1;
   ctx.beginPath();
   [-4.2, -1.3, 1.7, 4.3].forEach((lx, i) => {
-    const s = Math.sin(gallop + i * 1.3) * (moving ? 1.7 : 0.15);
+    const s = Math.sin(gallop + (i === 0 || i === 3 ? 0 : Math.PI)) * lift;
     ctx.moveTo(lx, 0.5);
     ctx.lineTo(lx + s, 3.8);
   });
@@ -836,6 +913,8 @@ function drawGun(ctx, spec, time, order) {
 }
 
 function drawShip(ctx, spec, time) {
+  const rowing = (spec.speed || 0) > 5;
+  ctx.translate(Math.sin(time * 1.3 + (spec.phase || 0)) * (rowing ? 0.8 : 0.25), 0);
   ctx.fillStyle = spec.hull || "#6b4226";
   ctx.beginPath();
   ctx.moveTo(18, 0);
@@ -851,7 +930,7 @@ function drawShip(ctx, spec, time) {
     ctx.strokeStyle = "rgba(50,36,22,0.55)";
     ctx.lineWidth = 0.7;
     for (let i = -8; i <= 8; i += 3.2) {
-      const sway = Math.sin(time * 2.2 + i) * 0.7;
+      const sway = Math.sin(time * (rowing ? 3.4 : 1.1) + i) * (rowing ? 1.35 : 0.35);
       ctx.beginPath();
       ctx.moveTo(i, -3);
       ctx.lineTo(i - 1.5, -8.5 - sway);
@@ -924,7 +1003,7 @@ function slotsFor(u) {
     if (u.shape === "wedge" && rows > 1) taper = 0.18 + 0.82 * (rank / (rows - 1));
     const right = cols === 1 ? 0 : (file / (cols - 1) - 0.5) * u.width * taper;
     const forward = rows === 1 ? 0 : -(rank / (rows - 1)) * u.depth;
-    out.push({ x: forward, y: right, facing: 0, i });
+    out.push({ x: forward, y: right, facing: 0, i, rank, rows });
   }
   return out;
 }
@@ -1044,6 +1123,34 @@ function drawMass(ctx, u, color) {
   ctx.stroke();
 }
 
+function unitSpeed(u, t) {
+  if (!u.keys) return 0;
+  const past = sampleTrack(u.keys, t - 0.18);
+  return Math.hypot(u.x - past.x, u.y - past.y) / 0.18;
+}
+
+function pathLag(u, t, rankFrac) {
+  if (!rankFrac || u.shape === "arc" || u.kind === "ship" || u.kind === "gun" || !u.keys) return [0, 0];
+  const lag = u.order === "charge" ? 0.34 : u.order === "rout" ? 1.1 : u.order === "march" ? 0.72 : 0;
+  if (lag <= 0) return [0, 0];
+  const past = sampleTrack(u.keys, t - lag * rankFrac);
+  let dx = past.x - u.x;
+  let dy = past.y - u.y;
+  const dist = Math.hypot(dx, dy);
+  const cap = u.order === "rout" ? 34 : 16;
+  if (dist > cap && dist > 0) {
+    dx = (dx / dist) * cap;
+    dy = (dy / dist) * cap;
+  }
+  const fx = Math.cos(u.facing);
+  const fy = Math.sin(u.facing);
+  const forward = dx * fx + dy * fy;
+  const right = -dx * fy + dy * fx;
+  // A little stretch along the line of march, and the full sideways
+  // lag so the rear of the column cuts the corner.
+  return [forward * 0.45, right * 0.9];
+}
+
 function drawUnit(ctx, battle, u, time) {
   if (u.opacity <= 0.03) return;
   const g = groundLift(battle, u.x, u.y);
@@ -1051,6 +1158,9 @@ function drawUnit(ctx, battle, u, time) {
   ctx.save();
   ctx.translate(u.x, u.y - g + sink);
   if (u.shape !== "arc") ctx.rotate(u.facing);
+  const shove = u.order === "fight" ? Math.sin(time * 2.7 + hash(u.x | 0, 5) * 5) * 3.2 : 0;
+  if (u.shape === "arc") ctx.translate(Math.cos(u.facing) * shove, Math.sin(u.facing) * shove);
+  else ctx.translate(shove, 0);
   ctx.globalAlpha = u.opacity;
   const color = u.coat || battle.sides.find((s) => s.id === u.side)?.color || "#888";
   ctx.save();
@@ -1083,14 +1193,30 @@ function drawUnit(ctx, battle, u, time) {
   };
   if (u.kind === "infantry" && !u.weapon) spec.weapon = "spear";
   const fig = u.figScale || (u.kind === "cavalry" ? 1.02 : u.kind === "ship" ? 1.25 : 1);
+  const speed = unitSpeed(u, time);
+  spec.speed = speed;
+  spec.clock = time;
+  spec.jitter = u.jitter || 0;
   for (const s of slotsFor(u)) {
     ctx.save();
-    const jx = (hash(s.i + 1, 4) - 0.5) * 2 * (u.jitter || 0);
-    const jy = (hash(s.i + 1, 8) - 0.5) * 2 * (u.jitter || 0);
-    ctx.translate(s.x + jx, s.y + jy);
+    const rankFrac =
+      u.shape === "scatter" ? hash(s.i + 2, 9) : s.rows > 1 ? s.rank / (s.rows - 1) : 0;
+    const [lagX, lagY] = pathLag(u, time, rankFrac);
+    let jx = 0;
+    let jy = 0;
+    if (u.order === "rout") {
+      jx = (hash(s.i + 1, 4) - 0.5) * (u.jitter || 0) * 1.8;
+      jy = (hash(s.i + 1, 8) - 0.5) * (u.jitter || 0) * 2.4;
+    } else {
+      jx = (hash(s.i + 1, 4) - 0.5) * (u.jitter || 0);
+      jy = (hash(s.i + 1, 8) - 0.5) * (u.jitter || 0);
+    }
+    ctx.translate(s.x + jx + lagX, s.y + jy + lagY);
     if (u.shape === "arc") ctx.rotate(s.facing);
+    else if (speed > 6) ctx.rotate(clamp((hash(s.i, 3) - 0.5) * 0.08, -0.08, 0.08));
     ctx.scale(fig, fig);
-    spec.phase = s.i * 0.65;
+    spec.phase = s.i * 0.7;
+    spec.slot = s.i;
     if (s.draw === "ship" || u.kind === "ship") drawShip(ctx, spec, time);
     else if (s.draw === "gun" || u.kind === "gun") drawGun(ctx, spec, time, u.order);
     else if (u.kind === "cavalry") drawHorse(ctx, spec, time, u.order);
@@ -1364,7 +1490,7 @@ export function drawBattle(ctx, battle, sample, time, ambient, fx, view, options
     });
   });
   sample.units.forEach((u, i) => {
-    sprites.push({ y: u.y, i: 1000 + i, draw: () => drawUnit(ctx, battle, u, time) });
+    sprites.push({ y: u.y, i: 1000 + i, draw: () => drawUnit(ctx, battle, u, sample.time) });
   });
   sprites.sort((a, b) => a.y - b.y || a.i - b.i);
   for (const s of sprites) s.draw();
